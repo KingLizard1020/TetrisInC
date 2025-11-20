@@ -342,6 +342,7 @@ static void spawn_piece(void) {
 
     if (!board_can_place(&g_board, shape, g_active_piece.rotation, g_active_piece.row, g_active_piece.col)) {
         g_game_over = true;
+        cancel_lock_delay();
         g_active_piece.active = false;
     }
 }
@@ -436,6 +437,7 @@ static void reset_board_state(void) {
 }
 
 static void settle_active_piece(int drop_bonus_cells) {
+    cancel_lock_delay();
     lock_piece();
 
     if (drop_bonus_cells > 0) {

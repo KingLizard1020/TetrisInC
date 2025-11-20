@@ -46,8 +46,34 @@ static void test_bag_multiple_cycles(void) {
     }
 }
 
+static void test_bag_many_cycles_distribution(void) {
+    PieceBag bag;
+    piece_bag_init(&bag, 7);
+
+    int counts[7];
+    memset(counts, 0, sizeof(counts));
+
+    for (int i = 0; i < 7 * 10; ++i) {
+        int value = piece_bag_next(&bag);
+        assert(value >= 0 && value < 7);
+        ++counts[value];
+    }
+
+    for (int i = 0; i < 7; ++i) {
+        assert(counts[i] == 10);
+    }
+}
+
+static void test_bag_handles_zero_pieces(void) {
+    PieceBag bag;
+    piece_bag_init(&bag, 0);
+    assert(piece_bag_next(&bag) == -1);
+}
+
 int main(void) {
     run_test("bag_cycle_contains_all", test_bag_cycle_contains_all);
     run_test("bag_multiple_cycles", test_bag_multiple_cycles);
+    run_test("bag_many_cycles_distribution", test_bag_many_cycles_distribution);
+    run_test("bag_handles_zero_pieces", test_bag_handles_zero_pieces);
     return 0;
 }
