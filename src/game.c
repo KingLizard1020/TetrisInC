@@ -10,52 +10,25 @@
 #include <string.h>
 #include <time.h>
 
+#include "board.h"
 #include "game.h"
-
-#define BOARD_WIDTH 10
-#define BOARD_HEIGHT 20
-#define CELL_EMPTY 0
+#include "piece.h"
 
 #define GRAVITY_INTERVAL_MS 700ULL
-
-typedef struct {
-    int size;
-    int rotation_count;
-    const char *rotations[4];
-} PieceDef;
-
-typedef struct {
-    int type;
-    int rotation;
-    int row;
-    int col;
-    bool active;
-} ActivePiece;
-
-static const PieceDef g_piece_defs[] = {
-    {4, 2, {"0000111100000000", "0010001000100010"}},              /* I */
-    {4, 1, {"0011001100000000"}},                                  /* O */
-    {4, 4, {"0000010011100000", "0010011000100000", "0000111001000000", "0100011001000000"}}, /* T */
-    {4, 4, {"0000001000100011", "0000111001000000", "0011001000100000", "0000010011100000"}}, /* L */
-    {4, 4, {"0000001000100110", "0000111000100000", "0011010001000000", "0010001110000000"}}, /* J */
-    {4, 2, {"0000011001100000", "0010011000100000"}},              /* S */
-    {4, 2, {"0000110001100000", "0000011001000010"}}               /* Z */
-};
-
-static const size_t PIECE_COUNT = sizeof(g_piece_defs) / sizeof(g_piece_defs[0]);
+#define CELL_EMPTY 0
 
 static bool g_use_color = false;
-static int g_board[BOARD_HEIGHT][BOARD_WIDTH];
+static Board g_board;
 static ActivePiece g_active_piece;
 static uint64_t g_gravity_accumulator_ms = 0ULL;
 
-static void board_reset(void);
 static void spawn_piece(void);
+static const PieceShape *current_piece_shape(void);
 static bool try_move_piece(int drow, int dcol);
 static bool try_rotate_piece(int direction);
-static bool can_place_piece(int test_row, int test_col, int rotation);
 static void lock_piece(void);
 static void clear_completed_lines(void);
+static void reset_board_state(void);
 static void handle_input(int ch, bool *running);
 static void update_game(uint64_t delta_ms);
 static uint64_t monotonic_millis(void);
@@ -64,7 +37,6 @@ static bool has_enough_space(void);
 static void draw_banner(void);
 static void draw_board(int origin_y, int origin_x);
 static void draw_active_piece(int origin_y, int origin_x);
-static void draw_piece_cells(int screen_y, int screen_x);
 
 int game_init(void) {
     if (initscr() == NULL) {
@@ -84,7 +56,7 @@ int game_init(void) {
         g_use_color = true;
     }
 
-    board_reset();
+    reset_board_state();
     srand((unsigned int)time(NULL));
     spawn_piece();
 
@@ -131,12 +103,6 @@ static void draw_frame(void) {
     refresh();
 }
 
-static void board_reset(void) {
-    memset(g_board, 0, sizeof(g_board));
-    g_active_piece.active = false;
-    g_gravity_accumulator_ms = 0ULL;
-}
-
 static bool has_enough_space(void) {
     const int min_rows = BOARD_HEIGHT + 8;
     const int min_cols = BOARD_WIDTH * 2 + 18;
@@ -170,7 +136,7 @@ static void draw_board(int origin_y, int origin_x) {
         move(origin_y + row, origin_x - 1);
         addch('|');
         for (int col = 0; col < BOARD_WIDTH; ++col) {
-            if (g_board[row][col] != CELL_EMPTY) {
+            if (g_board.cells[row][col] != CELL_EMPTY) {
                 if (g_use_color) {
                     attron(COLOR_PAIR(1));
                 }
@@ -198,12 +164,12 @@ static void draw_active_piece(int origin_y, int origin_x) {
         return;
     }
 
-    const PieceDef *def = &g_piece_defs[g_active_piece.type];
-    const char *pattern = def->rotations[g_active_piece.rotation];
+    const PieceShape *shape = current_piece_shape();
+    const char *pattern = shape->rotations[g_active_piece.rotation];
 
-    for (int r = 0; r < def->size; ++r) {
-        for (int c = 0; c < def->size; ++c) {
-            if (pattern[r * def->size + c] != '1') {
+    for (int r = 0; r < shape->size; ++r) {
+        for (int c = 0; c < shape->size; ++c) {
+            if (pattern[r * shape->size + c] != '1') {
                 continue;
             }
 
@@ -288,21 +254,22 @@ static uint64_t monotonic_millis(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
 }
 
-static const PieceDef *current_piece_def(void) {
-    return &g_piece_defs[g_active_piece.type];
-}
-
 static void spawn_piece(void) {
-    g_active_piece.type = (int)(rand() % (int)PIECE_COUNT);
+    size_t total_shapes = piece_shape_count();
+    if (total_shapes == 0) {
+        g_active_piece.active = false;
+        return;
+    }
+
+    g_active_piece.type = (int)(rand() % (int)total_shapes);
     g_active_piece.rotation = 0;
     g_active_piece.row = -2;
-    const PieceDef *def = current_piece_def();
-    g_active_piece.col = (BOARD_WIDTH - def->size) / 2;
+    const PieceShape *shape = current_piece_shape();
+    g_active_piece.col = (BOARD_WIDTH - shape->size) / 2;
     g_active_piece.active = true;
 
-    if (!can_place_piece(g_active_piece.row, g_active_piece.col, g_active_piece.rotation)) {
-        board_reset();
-        g_active_piece.active = false;
+    if (!board_can_place(&g_board, shape, g_active_piece.rotation, g_active_piece.row, g_active_piece.col)) {
+        reset_board_state();
     }
 }
 
@@ -313,7 +280,8 @@ static bool try_move_piece(int drow, int dcol) {
 
     int next_row = g_active_piece.row + drow;
     int next_col = g_active_piece.col + dcol;
-    if (!can_place_piece(next_row, next_col, g_active_piece.rotation)) {
+    const PieceShape *shape = current_piece_shape();
+    if (!board_can_place(&g_board, shape, g_active_piece.rotation, next_row, next_col)) {
         return false;
     }
 
@@ -327,43 +295,13 @@ static bool try_rotate_piece(int direction) {
         return false;
     }
 
-    const PieceDef *def = current_piece_def();
-    int next_rotation = (g_active_piece.rotation + direction + def->rotation_count) % def->rotation_count;
-    if (!can_place_piece(g_active_piece.row, g_active_piece.col, next_rotation)) {
+    const PieceShape *shape = current_piece_shape();
+    int next_rotation = (g_active_piece.rotation + direction + shape->rotation_count) % shape->rotation_count;
+    if (!board_can_place(&g_board, shape, next_rotation, g_active_piece.row, g_active_piece.col)) {
         return false;
     }
 
     g_active_piece.rotation = next_rotation;
-    return true;
-}
-
-static bool can_place_piece(int test_row, int test_col, int rotation) {
-    const PieceDef *def = &g_piece_defs[g_active_piece.type];
-    const char *pattern = def->rotations[rotation];
-
-    for (int r = 0; r < def->size; ++r) {
-        for (int c = 0; c < def->size; ++c) {
-            if (pattern[r * def->size + c] != '1') {
-                continue;
-            }
-
-            int board_row = test_row + r;
-            int board_col = test_col + c;
-
-            if (board_row < 0) {
-                continue;
-            }
-
-            if (board_col < 0 || board_col >= BOARD_WIDTH || board_row >= BOARD_HEIGHT) {
-                return false;
-            }
-
-            if (g_board[board_row][board_col] != CELL_EMPTY) {
-                return false;
-            }
-        }
-    }
-
     return true;
 }
 
@@ -372,47 +310,21 @@ static void lock_piece(void) {
         return;
     }
 
-    const PieceDef *def = current_piece_def();
-    const char *pattern = def->rotations[g_active_piece.rotation];
-
-    for (int r = 0; r < def->size; ++r) {
-        for (int c = 0; c < def->size; ++c) {
-            if (pattern[r * def->size + c] != '1') {
-                continue;
-            }
-
-            int board_row = g_active_piece.row + r;
-            int board_col = g_active_piece.col + c;
-
-            if (board_row < 0 || board_row >= BOARD_HEIGHT || board_col < 0 || board_col >= BOARD_WIDTH) {
-                continue;
-            }
-
-            g_board[board_row][board_col] = g_active_piece.type + 1;
-        }
-    }
-
+    const PieceShape *shape = current_piece_shape();
+    board_lock_shape(&g_board, shape, g_active_piece.rotation, g_active_piece.row, g_active_piece.col, g_active_piece.type + 1);
     g_active_piece.active = false;
 }
 
 static void clear_completed_lines(void) {
-    for (int row = BOARD_HEIGHT - 1; row >= 0; --row) {
-        bool full = true;
-        for (int col = 0; col < BOARD_WIDTH; ++col) {
-            if (g_board[row][col] == CELL_EMPTY) {
-                full = false;
-                break;
-            }
-        }
+    (void)board_clear_completed_lines(&g_board);
+}
 
-        if (!full) {
-            continue;
-        }
+static const PieceShape *current_piece_shape(void) {
+    return piece_shape_get((size_t)g_active_piece.type);
+}
 
-        for (int move_row = row; move_row > 0; --move_row) {
-            memcpy(g_board[move_row], g_board[move_row - 1], sizeof(g_board[move_row]));
-        }
-        memset(g_board[0], 0, sizeof(g_board[0]));
-        ++row; /* recheck same row after collapsing */
-    }
+static void reset_board_state(void) {
+    board_reset(&g_board);
+    g_active_piece.active = false;
+    g_gravity_accumulator_ms = 0ULL;
 }
