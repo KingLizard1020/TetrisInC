@@ -16,12 +16,19 @@
 #include "piece.h"
 #include "score.h"
 
+typedef enum {
+    GAME_STATE_TITLE,
+    GAME_STATE_PLAYING,
+    GAME_STATE_GAME_OVER
+} GameState;
+
 #define GRAVITY_INTERVAL_MS 700ULL
 #define MIN_GRAVITY_INTERVAL_MS 120ULL
 #define LOCK_DELAY_MS 500ULL
 #define LINES_PER_LEVEL 10
 #define CELL_EMPTY 0
 
+static GameState g_state = GAME_STATE_TITLE;
 static bool g_use_color = false;
 static Board g_board;
 static ActivePiece g_active_piece;
@@ -29,7 +36,6 @@ static uint64_t g_gravity_accumulator_ms = 0ULL;
 static ScoreState g_score;
 static int g_next_piece_type = -1;
 static PieceBag g_piece_bag;
-static bool g_game_over = false;
 static bool g_lock_pending = false;
 static uint64_t g_lock_timer_ms = 0ULL;
 static int g_total_lines_cleared = 0;
@@ -43,6 +49,7 @@ static int g_drop_flash_row[16];
 static int g_drop_flash_col[16];
 static int g_drop_flash_count = 0;
 static int g_hud_pulse_timer = 0;
+static void start_new_game(void);
 
 static void spawn_piece(void);
 static const PieceShape *current_piece_shape(void);
@@ -70,10 +77,12 @@ static void draw_frame(void);
 static bool has_enough_space(void);
 static void draw_banner(void);
 static void draw_board(int origin_y, int origin_x);
+static void draw_ghost_piece(int origin_y, int origin_x);
 static void draw_active_piece(int origin_y, int origin_x);
 static void draw_score_panel(int origin_y, int origin_x);
 static void draw_next_piece_panel(int origin_y, int origin_x);
 static void draw_piece_preview(int origin_y, int origin_x, const PieceShape *shape);
+static void draw_title_overlay(void);
 
 int game_init(void) {
     if (initscr() == NULL) {
@@ -92,6 +101,7 @@ int game_init(void) {
         init_pair(1, COLOR_CYAN, -1);
         init_pair(2, COLOR_YELLOW, -1);
         init_pair(3, COLOR_BLUE, -1);
+        init_pair(4, COLOR_WHITE, -1);
         g_use_color = true;
     }
 
@@ -99,7 +109,7 @@ int game_init(void) {
     score_state_init(&g_score, SCORE_DEFAULT_FILE);
     reset_board_state();
     ensure_next_piece();
-    spawn_piece();
+    g_state = GAME_STATE_TITLE;
 
     return 0;
 }
@@ -144,10 +154,14 @@ static void draw_frame(void) {
 
     draw_banner();
     draw_board(board_origin_y, board_origin_x);
+    draw_ghost_piece(board_origin_y, board_origin_x);
     draw_active_piece(board_origin_y, board_origin_x);
     draw_drop_flash(board_origin_y, board_origin_x);
     draw_score_panel(board_origin_y, hud_origin_x);
     draw_next_piece_panel(board_origin_y + 6, hud_origin_x);
+    if (g_state == GAME_STATE_TITLE) {
+        draw_title_overlay();
+    }
 
     refresh();
 }
@@ -167,11 +181,13 @@ static void draw_banner(void) {
         attroff(COLOR_PAIR(1));
     }
 
-    if (g_game_over) {
+    if (g_state == GAME_STATE_TITLE) {
+        mvprintw(2, 2, "Press ENTER to start, 'q' to quit");
+    } else if (g_state == GAME_STATE_GAME_OVER) {
         mvprintw(2, 2, "Game Over - press 'r' to restart or 'q' to quit");
     } else {
         mvprintw(2, 2, "Press 'q' to quit");
-        mvprintw(3, 2, "Arrows move, Space hard drops.");
+        mvprintw(3, 2, "Arrows/WASD move, Space hard drops.");
     }
 }
 
@@ -191,6 +207,9 @@ static void draw_board(int origin_y, int origin_x) {
         bool flashing = g_line_flash_timer > 0 && g_line_flash_rows[row];
         if (flashing) {
             attron(A_REVERSE);
+            if (g_use_color) {
+                attron(COLOR_PAIR(2));
+            }
         }
         for (int col = 0; col < BOARD_WIDTH; ++col) {
             if (g_board.cells[row][col] != CELL_EMPTY) {
@@ -207,6 +226,9 @@ static void draw_board(int origin_y, int origin_x) {
         }
         if (flashing) {
             attroff(A_REVERSE);
+            if (g_use_color) {
+                attroff(COLOR_PAIR(2));
+            }
         }
         addch('|');
     }
@@ -217,6 +239,54 @@ static void draw_board(int origin_y, int origin_x) {
         addch('-');
     }
     addch('+');
+}
+
+static void draw_ghost_piece(int origin_y, int origin_x) {
+    if (g_state != GAME_STATE_PLAYING || !g_active_piece.active) {
+        return;
+    }
+
+    ActivePiece ghost = g_active_piece;
+    const PieceShape *shape = current_piece_shape();
+    if (shape == NULL) {
+        return;
+    }
+
+    while (board_can_place(&g_board, shape, ghost.rotation, ghost.row + 1, ghost.col)) {
+        ++ghost.row;
+    }
+
+    if (ghost.row == g_active_piece.row) {
+        return;
+    }
+
+    const char *pattern = shape->rotations[ghost.rotation];
+    for (int r = 0; r < shape->size; ++r) {
+        for (int c = 0; c < shape->size; ++c) {
+            if (pattern[r * shape->size + c] != '1') {
+                continue;
+            }
+
+            int board_row = ghost.row + r;
+            int board_col = ghost.col + c;
+            if (board_row < 0 || board_row >= BOARD_HEIGHT || board_col < 0 || board_col >= BOARD_WIDTH) {
+                continue;
+            }
+
+            move(origin_y + board_row, origin_x + board_col * 2);
+            if (g_use_color) {
+                attron(COLOR_PAIR(4));
+            } else {
+                attron(A_DIM);
+            }
+            addstr("..");
+            if (g_use_color) {
+                attroff(COLOR_PAIR(4));
+            } else {
+                attroff(A_DIM);
+            }
+        }
+    }
 }
 
 static void draw_active_piece(int origin_y, int origin_x) {
@@ -259,11 +329,18 @@ static void handle_input(int ch, bool *running) {
         return;
     }
 
-    if (g_game_over) {
-        if (ch == 'r' || ch == 'R') {
-            reset_board_state();
-            ensure_next_piece();
-            spawn_piece();
+    if (g_state == GAME_STATE_TITLE) {
+        if (ch == 'q' || ch == 'Q') {
+            *running = false;
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER || ch == ' ') {
+            start_new_game();
+        }
+        return;
+    }
+
+    if (g_state == GAME_STATE_GAME_OVER) {
+        if (ch == 'r' || ch == 'R' || ch == ' ') {
+            start_new_game();
         } else if (ch == 'q' || ch == 'Q') {
             *running = false;
         }
@@ -316,7 +393,7 @@ static void handle_input(int ch, bool *running) {
 }
 
 static void update_game(uint64_t delta_ms) {
-    if (g_game_over) {
+    if (g_state != GAME_STATE_PLAYING) {
         return;
     }
 
@@ -365,7 +442,7 @@ static void spawn_piece(void) {
     g_active_piece.active = true;
 
     if (!board_can_place(&g_board, shape, g_active_piece.rotation, g_active_piece.row, g_active_piece.col)) {
-        g_game_over = true;
+        g_state = GAME_STATE_GAME_OVER;
         cancel_lock_delay();
         g_active_piece.active = false;
     }
@@ -453,7 +530,6 @@ static void reset_board_state(void) {
     g_total_lines_cleared = 0;
     g_level = 1;
     g_current_gravity_interval_ms = gravity_interval_for_level(g_level);
-    g_game_over = false;
     g_lock_pending = false;
     g_lock_timer_ms = 0ULL;
     piece_bag_init(&g_piece_bag, piece_shape_count());
@@ -463,6 +539,13 @@ static void reset_board_state(void) {
     g_drop_flash_count = 0;
     g_hud_pulse_timer = 0;
     score_reset_current(&g_score);
+}
+
+static void start_new_game(void) {
+    reset_board_state();
+    ensure_next_piece();
+    spawn_piece();
+    g_state = GAME_STATE_PLAYING;
 }
 
 static void settle_active_piece(int drop_bonus_cells) {
@@ -486,12 +569,12 @@ static void settle_active_piece(int drop_bonus_cells) {
         score_add_lines(&g_score, cleared);
         g_total_lines_cleared += cleared;
         trigger_line_flash(g_cleared_rows_buffer, cleared);
+        trigger_hud_pulse();
         update_level_and_speed();
     }
 
     if (score_commit_highscore(&g_score)) {
         score_state_save(&g_score);
-        trigger_hud_pulse();
     }
 
     spawn_piece();
@@ -693,4 +776,28 @@ static void draw_drop_flash(int origin_y, int origin_x) {
             attroff(A_DIM);
         }
     }
+}
+
+static void draw_title_overlay(void) {
+    const char *title = "Terminal Tetris";
+    const char *subtitle = "Press ENTER to start, Q to quit";
+    const char *controls = "Use arrows/WASD, space for hard drop";
+
+    int center_y = LINES / 3;
+    int center_x = COLS / 2;
+
+    if (g_use_color) {
+        attron(COLOR_PAIR(2));
+    } else {
+        attron(A_BOLD);
+    }
+    mvprintw(center_y, center_x - (int)strlen(title) / 2, "%s", title);
+    if (g_use_color) {
+        attroff(COLOR_PAIR(2));
+    } else {
+        attroff(A_BOLD);
+    }
+
+    mvprintw(center_y + 2, center_x - (int)strlen(subtitle) / 2, "%s", subtitle);
+    mvprintw(center_y + 3, center_x - (int)strlen(controls) / 2, "%s", controls);
 }
