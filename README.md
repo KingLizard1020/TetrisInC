@@ -2,6 +2,12 @@
 
 Tiny curses playground for evolving a Tetris clone. Runs with `ncurses` on macOS/Linux and `pdcurses` on Windows.
 
+## Features
+
+- Score tracking with persistent high score (`highscore.dat`)
+- Next-piece preview plus hard drop for faster play
+- Automated logic tests via `make test`
+
 ## Build & Run
 
 **macOS / Linux**
@@ -26,5 +32,6 @@ mingw32-make test
 - Arrow keys or A/D: move piece
 - Up or W: rotate
 - Down or S: soft drop
+- Space: hard drop
 - Q: quit
 ```

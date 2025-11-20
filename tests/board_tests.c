@@ -25,7 +25,7 @@ static void test_board_can_place_blocked(void) {
     const PieceShape *shape = first_shape();
     assert(shape != NULL);
 
-    board.cells[0][3] = 99;
+    board.cells[1][3] = 99;
     assert(!board_can_place(&board, shape, 0, 0, 3));
 }
 
@@ -36,7 +36,7 @@ static void test_board_lock_and_clear(void) {
     assert(shape != NULL);
 
     board_lock_shape(&board, shape, 0, 0, 3, 1);
-    assert(board.cells[0][3] == 1);
+    assert(board.cells[1][3] == 1);
 
     for (int col = 0; col < BOARD_WIDTH; ++col) {
         board.cells[BOARD_HEIGHT - 1][col] = 5;

@@ -13,6 +13,7 @@
 #include "board.h"
 #include "game.h"
 #include "piece.h"
+#include "score.h"
 
 #define GRAVITY_INTERVAL_MS 700ULL
 #define CELL_EMPTY 0
@@ -21,22 +22,30 @@ static bool g_use_color = false;
 static Board g_board;
 static ActivePiece g_active_piece;
 static uint64_t g_gravity_accumulator_ms = 0ULL;
+static ScoreState g_score;
+static int g_next_piece_type = -1;
 
 static void spawn_piece(void);
 static const PieceShape *current_piece_shape(void);
+static const PieceShape *next_piece_shape(void);
+static void ensure_next_piece(void);
 static bool try_move_piece(int drow, int dcol);
 static bool try_rotate_piece(int direction);
 static void lock_piece(void);
-static void clear_completed_lines(void);
+static int clear_completed_lines(void);
 static void reset_board_state(void);
 static void handle_input(int ch, bool *running);
 static void update_game(uint64_t delta_ms);
 static uint64_t monotonic_millis(void);
+static void settle_active_piece(int drop_bonus_cells);
 static void draw_frame(void);
 static bool has_enough_space(void);
 static void draw_banner(void);
 static void draw_board(int origin_y, int origin_x);
 static void draw_active_piece(int origin_y, int origin_x);
+static void draw_score_panel(int origin_y, int origin_x);
+static void draw_next_piece_panel(int origin_y, int origin_x);
+static void draw_piece_preview(int origin_y, int origin_x, const PieceShape *shape);
 
 int game_init(void) {
     if (initscr() == NULL) {
@@ -56,8 +65,10 @@ int game_init(void) {
         g_use_color = true;
     }
 
+    score_state_init(&g_score, SCORE_DEFAULT_FILE);
     reset_board_state();
     srand((unsigned int)time(NULL));
+    ensure_next_piece();
     spawn_piece();
 
     return 0;
@@ -96,9 +107,15 @@ static void draw_frame(void) {
         return;
     }
 
+    const int board_origin_y = 4;
+    const int board_origin_x = 8;
+    const int hud_origin_x = board_origin_x + BOARD_WIDTH * 2 + 4;
+
     draw_banner();
-    draw_board(4, 8);
-    draw_active_piece(4, 8);
+    draw_board(board_origin_y, board_origin_x);
+    draw_active_piece(board_origin_y, board_origin_x);
+    draw_score_panel(board_origin_y, hud_origin_x);
+    draw_next_piece_panel(board_origin_y + 6, hud_origin_x);
 
     refresh();
 }
@@ -119,7 +136,7 @@ static void draw_banner(void) {
     }
 
     mvprintw(2, 2, "Press 'q' to quit");
-    mvprintw(3, 2, "Pieces fall automatically. Arrows move.");
+    mvprintw(3, 2, "Arrows move, Space hard drops.");
 }
 
 static void draw_board(int origin_y, int origin_x) {
@@ -218,15 +235,22 @@ static void handle_input(int ch, bool *running) {
         case 's':
         case 'S':
             if (!try_move_piece(1, 0)) {
-                lock_piece();
-                clear_completed_lines();
-                spawn_piece();
+                settle_active_piece(0);
             }
             break;
         case KEY_UP:
         case 'w':
         case 'W':
             try_rotate_piece(1);
+            break;
+        case ' ':
+            {
+                int dropped = 0;
+                while (try_move_piece(1, 0)) {
+                    ++dropped;
+                }
+                settle_active_piece(dropped);
+            }
             break;
     }
 }
@@ -240,9 +264,7 @@ static void update_game(uint64_t delta_ms) {
     while (g_gravity_accumulator_ms >= GRAVITY_INTERVAL_MS) {
         g_gravity_accumulator_ms -= GRAVITY_INTERVAL_MS;
         if (!try_move_piece(1, 0)) {
-            lock_piece();
-            clear_completed_lines();
-            spawn_piece();
+            settle_active_piece(0);
             break;
         }
     }
@@ -261,7 +283,9 @@ static void spawn_piece(void) {
         return;
     }
 
-    g_active_piece.type = (int)(rand() % (int)total_shapes);
+    ensure_next_piece();
+    g_active_piece.type = g_next_piece_type;
+    g_next_piece_type = (int)(rand() % (int)total_shapes);
     g_active_piece.rotation = 0;
     g_active_piece.row = -2;
     const PieceShape *shape = current_piece_shape();
@@ -270,6 +294,7 @@ static void spawn_piece(void) {
 
     if (!board_can_place(&g_board, shape, g_active_piece.rotation, g_active_piece.row, g_active_piece.col)) {
         reset_board_state();
+        ensure_next_piece();
     }
 }
 
@@ -315,16 +340,105 @@ static void lock_piece(void) {
     g_active_piece.active = false;
 }
 
-static void clear_completed_lines(void) {
-    (void)board_clear_completed_lines(&g_board);
+static int clear_completed_lines(void) {
+    return board_clear_completed_lines(&g_board);
 }
 
 static const PieceShape *current_piece_shape(void) {
     return piece_shape_get((size_t)g_active_piece.type);
 }
 
+static const PieceShape *next_piece_shape(void) {
+    if (g_next_piece_type < 0) {
+        return NULL;
+    }
+    return piece_shape_get((size_t)g_next_piece_type);
+}
+
+static void ensure_next_piece(void) {
+    if (g_next_piece_type >= 0) {
+        return;
+    }
+
+    size_t total_shapes = piece_shape_count();
+    if (total_shapes == 0) {
+        g_next_piece_type = -1;
+        return;
+    }
+
+    g_next_piece_type = (int)(rand() % (int)total_shapes);
+}
+
 static void reset_board_state(void) {
     board_reset(&g_board);
     g_active_piece.active = false;
     g_gravity_accumulator_ms = 0ULL;
+    g_next_piece_type = -1;
+    score_reset_current(&g_score);
+}
+
+static void settle_active_piece(int drop_bonus_cells) {
+    lock_piece();
+
+    if (drop_bonus_cells > 0) {
+        score_add_drop(&g_score, drop_bonus_cells);
+    }
+
+    int cleared = clear_completed_lines();
+    if (cleared > 0) {
+        score_add_lines(&g_score, cleared);
+    }
+
+    if (score_commit_highscore(&g_score)) {
+        score_state_save(&g_score);
+    }
+
+    spawn_piece();
+}
+
+static void draw_score_panel(int origin_y, int origin_x) {
+    mvprintw(origin_y, origin_x,   "Score     : %d", g_score.current);
+    mvprintw(origin_y + 1, origin_x, "High Score: %d", g_score.high);
+}
+
+static void draw_next_piece_panel(int origin_y, int origin_x) {
+    mvprintw(origin_y, origin_x, "Next Piece:");
+
+    move(origin_y + 1, origin_x);
+    addstr("+--------+");
+    for (int row = 0; row < 4; ++row) {
+        move(origin_y + 2 + row, origin_x);
+        addch('|');
+        addstr("        ");
+        addch('|');
+    }
+    move(origin_y + 6, origin_x);
+    addstr("+--------+");
+
+    draw_piece_preview(origin_y + 2, origin_x + 1, next_piece_shape());
+}
+
+static void draw_piece_preview(int origin_y, int origin_x, const PieceShape *shape) {
+    if (shape == NULL) {
+        return;
+    }
+
+    const int preview_offset = (4 - shape->size) / 2;
+    const char *pattern = shape->rotations[0];
+    for (int r = 0; r < shape->size; ++r) {
+        for (int c = 0; c < shape->size; ++c) {
+            if (pattern[r * shape->size + c] != '1') {
+                continue;
+            }
+
+            move(origin_y + preview_offset + r, origin_x + preview_offset * 2 + c * 2);
+            if (g_use_color) {
+                attron(COLOR_PAIR(1));
+            }
+            addstr("[]");
+            if (g_use_color) {
+                attroff(COLOR_PAIR(1));
+            }
+        }
+    }
 }
