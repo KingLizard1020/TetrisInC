@@ -20,6 +20,7 @@ make test   # logic tests
 ```
 
 **Windows (MinGW + PDCurses)**
+Windows x64 is untested currently but will be further supported soon
 ```
 set CC=x86_64-w64-mingw32-gcc
 mingw32-make LDFLAGS=-lpdcurses
@@ -35,7 +36,5 @@ mingw32-make test
 - Space: hard drop
 - R: restart after game over
 - Q: quit
+```
 
-```
-`make test` covers bag randomization, board edge cases, scoring math, piece definitions, and scripted gravity/lock simulations for stress coverage.
-```
